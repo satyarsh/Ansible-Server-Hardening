@@ -1,6 +1,7 @@
 # Server hardening Ansible playbook
 
-Targets Ubuntu host. It updates and upgrades using APT before installing utilities, deploys the provided SSH and Fail2ban configs, installs Docker with the ArvanCloud registry mirror, creates `develop` user (inside docker group), adds optional public keys without deleting existing keys, schedules the resource check, and restricts inbound host and Docker-published traffic to TCP ports `6655`, `80`, and `443`.
+Targets Ubuntu host, tested on Ubuntu 26.04 with sudo-rs preinstalled. 
+It updates and upgrades using APT before installing utilities, deploys the provided SSH and Fail2ban configs, installs Docker with the ArvanCloud registry mirror, creates `develop` user (inside docker group), adds optional public keys without deleting existing keys, schedules the resource check, and restricts inbound host and Docker-published traffic to TCP ports `6655`, `80`, and `443`.
 
 ## Configure before running
 
@@ -37,7 +38,8 @@ After deployment, SSH listens on port `6655`. Keep the current SSH session open 
 - Sets `/etc/ssh/sshd_config.d/50-cloud-init.conf` to `PasswordAuthentication no` and validates the final SSH configuration.
 - Installs `/etc/fail2ban/jail.local`, sets the SSH jail port to `6655`, and enables Fail2ban.
 - Installs `/root/check_resources.sh` with mode `0744` and runs it every two minutes from root's crontab.
-- Keeps UFW inbound and routed traffic default-deny and allows only TCP `6655`, `80`, and `443` for both IPv4 and IPv6.
+- Disables IPV6 completely. 
+- Keeps UFW inbound and routed traffic default-deny and allows only TCP `6655`, `80`, and `443`.
 
 ## Notes
 
