@@ -1,0 +1,32 @@
+#!/bin/sh
+set -eu
+
+EXTERNAL_INTERFACE='{{ docker_external_interface }}'
+ALLOWED_PORTS='6655 80 443'
+
+# task is needed only if you want to ensure Docker containers
+# cannot expose ports outside your allowlist.
+
+for firewall in iptables ip6tables; do
+    command -v "$firewall" >/dev/null 2>&1 || continue
+    "$firewall" -w -nL DOCKER-USER >/dev/null 2>&1 || continue
+
+    "$firewall" -w -N SERVER-DOCKER-ALLOWLIST 2>/dev/null || true
+    "$firewall" -w -F SERVER-DOCKER-ALLOWLIST
+
+    # Preserve reply traffic; otherwise allow only published TCP ports 6655, 80, 443.
+    "$firewall" -w -A SERVER-DOCKER-ALLOWLIST -i "$EXTERNAL_INTERFACE" \
+        -m conntrack --ctstate ESTABLISHED,RELATED -j RETURN
+
+    for port in $ALLOWED_PORTS; do
+        "$firewall" -w -A SERVER-DOCKER-ALLOWLIST -i "$EXTERNAL_INTERFACE" \
+            -p tcp -m conntrack --ctorigdstport "$port" -j RETURN
+    done
+
+    # Drop all other new traffic arriving from the external interface to containers.
+    "$firewall" -w -A SERVER-DOCKER-ALLOWLIST -i "$EXTERNAL_INTERFACE" -j DROP
+    "$firewall" -w -A SERVER-DOCKER-ALLOWLIST -j RETURN
+
+    "$firewall" -w -C DOCKER-USER -j SERVER-DOCKER-ALLOWLIST 2>/dev/null || \
+        "$firewall" -w -I DOCKER-USER 1 -j SERVER-DOCKER-ALLOWLIST
+done

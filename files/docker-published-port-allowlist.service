@@ -1,0 +1,13 @@
+[Unit]
+Description=Restrict inbound traffic to Docker-published ports
+Requires=docker.service
+After=docker.service
+PartOf=docker.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/docker-port-allowlist.sh
+
+[Install]
+WantedBy=multi-user.target

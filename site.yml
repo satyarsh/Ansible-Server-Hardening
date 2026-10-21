@@ -1,0 +1,398 @@
+---
+- name: Harden and configure Ubuntu server
+  hosts: all
+  become: true
+  gather_facts: true
+
+  vars:
+    ssh_port: 4044
+    allowed_tcp_ports:
+    - 4044
+    - 80
+    - 443
+    required_packages:
+    - htop
+    - tmux
+    - fish
+    - fail2ban
+    - cron
+    - curl
+    - ca-certificates
+    - ufw
+    - procps
+    - iptables
+
+  tasks:
+  - name: Update APT package index
+    ansible.builtin.apt:
+      update_cache: true
+      cache_valid_time: 0
+
+  - name: Upgrade installed APT packages before installing requested packages
+    ansible.builtin.apt:
+      upgrade: yes
+
+  - name: Install requested utilities and required runtime packages
+    ansible.builtin.apt:
+      name: "{{ required_packages }}"
+      state: present
+      update_cache: false
+
+  - name: Persistently disable IPv6 through sysctl
+    ansible.builtin.copy:
+      dest: /etc/sysctl.d/99-disable-ipv6.conf
+      owner: root
+      group: root
+      mode: '0644'
+      content: |
+        net.ipv6.conf.all.disable_ipv6 = 1
+        net.ipv6.conf.default.disable_ipv6 = 1
+        net.ipv6.conf.lo.disable_ipv6 = 1
+
+  - name: Check whether IPv6 sysctl controls are available
+    ansible.builtin.stat:
+      path: /proc/sys/net/ipv6/conf/all/disable_ipv6
+    register: ipv6_sysctl_control
+
+  - name: Apply IPv6 sysctl settings immediately
+    ansible.builtin.command: sysctl -p /etc/sysctl.d/99-disable-ipv6.conf
+    when: ipv6_sysctl_control.stat.exists | default(false)
+    changed_when: false
+
+  - name: Check whether GRUB configuration is present
+    ansible.builtin.stat:
+      path: /etc/default/grub
+    register: grub_defaults_file
+
+  - name: Disable IPv6 in GRUB kernel command-line parameters
+    ansible.builtin.replace:
+      path: /etc/default/grub
+      regexp: '^(GRUB_CMDLINE_LINUX(?:_DEFAULT)?="(?![^"]*ipv6\.disable=1)[^"]*)"$'
+      replace: '\1 ipv6.disable=1"'
+    when: grub_defaults_file.stat.exists | default(false)
+    notify: Rebuild GRUB configuration
+
+  ### get.docker.com
+  # - name: Download the official Docker installation script
+  #   ansible.builtin.get_url:
+  #     url: https://get.docker.com
+  #     dest: /root/install-docker.sh
+  #     owner: root
+  #     group: root
+  #     mode: '0700'
+
+  # - name: Install Docker Engine using the official convenience script
+  #   ansible.builtin.command: sh /root/install-docker.sh
+  #   args:
+  #     creates: /usr/bin/docker
+  #   notify:
+  #   - Reload systemd daemon
+  #   - Restart Docker daemon
+  #   - Refresh Docker published-port allowlist
+
+  ### Iranian mirror for docker install
+  - name: Copy Docker installation script
+    ansible.builtin.copy:
+      src: files/docker-install.sh
+      dest: /root/docker-install.sh
+      owner: root
+      group: root
+      mode: '0700'
+
+  - name: Install Docker Engine
+    ansible.builtin.command: bash /root/docker-install.sh
+    args:
+      creates: /usr/bin/docker
+    notify:
+    - Reload systemd daemon
+    - Restart Docker daemon
+    - Refresh Docker published-port allowlist
+
+  - name: Ensure Docker service is enabled and running
+    ansible.builtin.systemd:
+      name: docker
+      enabled: true
+      state: started
+
+  - name: Create Docker daemon configuration directory
+    ansible.builtin.file:
+      path: /etc/docker
+      state: directory
+      owner: root
+      group: root
+      mode: '0755'
+
+  - name: Configure Docker registry mirror
+    ansible.builtin.copy:
+      dest: /etc/docker/daemon.json
+      owner: root
+      group: root
+      mode: '0644'
+      content: |
+        {
+          "insecure-registries": ["docker.arvancloud.ir"],
+          "registry-mirrors": ["https://docker.arvancloud.ir"]
+        }
+      validate: "{{ '/usr/bin/dockerd' }} --validate --config-file=%s"
+    notify:
+    - Reload systemd daemon
+    - Restart Docker daemon
+    - Refresh Docker published-port allowlist
+
+  - name: Log out root from the default Docker registry if credentials exist
+    ansible.builtin.command: docker logout
+    register: docker_logout_result
+    changed_when: "'Removing login credentials' in docker_logout_result.stdout"
+    failed_when: false
+
+  - name: Install Docker-published-port firewall script
+    ansible.builtin.template:
+      src: templates/docker-port-allowlist.sh.j2
+      dest: /usr/local/sbin/docker-port-allowlist.sh
+      owner: root
+      group: root
+      mode: '0750'
+    notify: Refresh Docker published-port allowlist
+
+  - name: Install Docker-published-port firewall systemd unit
+    ansible.builtin.copy:
+      src: files/docker-published-port-allowlist.service
+      dest: /etc/systemd/system/docker-published-port-allowlist.service
+      owner: root
+      group: root
+      mode: '0644'
+    notify:
+    - Reload systemd daemon
+    - Refresh Docker published-port allowlist
+
+  - name: Create develop user with a password
+    ansible.builtin.user:
+      name: develop
+      state: present
+      create_home: true
+      shell: /usr/bin/bash
+      groups:
+      - docker
+      append: true
+      password: "{{ develop_password_hash }}"
+      update_password: always
+
+  - name: Add public keys for the develop user without removing existing keys
+    ansible.posix.authorized_key:
+      user: develop
+      key: "{{ item }}"
+      state: present
+      exclusive: false
+      manage_dir: true
+    loop: "{{ develop_authorized_keys }}"
+
+  - name: Add public keys for the current Ansible SSH user without removing existing keys
+    ansible.posix.authorized_key:
+      user: "{{ admin_ssh_user }}"
+      key: "{{ item }}"
+      state: present
+      exclusive: false
+      manage_dir: true
+    loop: "{{ admin_authorized_keys }}"
+
+  - name: Resolve the current Ansible SSH user's account
+    ansible.builtin.command:
+      argv:
+      - getent
+      - passwd
+      - "{{ admin_ssh_user }}"
+    register: admin_passwd_entry
+    changed_when: false
+
+  - name: Set the current Ansible SSH user's home directory
+    ansible.builtin.set_fact:
+      admin_ssh_home: "{{ admin_passwd_entry.stdout.split(':')[5] }}"
+
+  - name: Check the current Ansible SSH user's authorized_keys file
+    ansible.builtin.stat:
+      path: "{{ admin_ssh_home }}/.ssh/authorized_keys"
+    register: admin_authorized_keys_file
+
+  - name: Refuse SSH hardening if the administrator has no key-based fallback
+    ansible.builtin.assert:
+      that:
+      - >-
+        (admin_authorized_keys | length > 0) or ((admin_authorized_keys_file.stat.exists | default(false)) and ((admin_authorized_keys_file.stat.size | default(0) | int) > 0))
+      fail_msg: >-
+        No existing {{ admin_ssh_home }}/.ssh/authorized_keys file was found (or it is empty), and admin_authorized_keys is empty. Add your public key to group_vars/servers.yml before changing SSH settings to avoid lockout.
+      success_msg: Key-based fallback for the Ansible SSH user is present.
+
+  - name: Install supplied Fail2ban jail configuration
+    ansible.builtin.copy:
+      src: files/jail.local
+      dest: /etc/fail2ban/jail.local
+      owner: root
+      group: root
+      mode: '0644'
+    notify: Restart Fail2ban
+
+  - name: Configure Fail2ban to monitor the custom SSH port
+    ansible.builtin.lineinfile:
+      path: /etc/fail2ban/jail.local
+      regexp: '^\s*port\s*='
+      line: 'port     = 4044'
+      owner: root
+      group: root
+      mode: '0644'
+    notify: Restart Fail2ban
+
+  - name: Install supplied sshd_config
+    ansible.builtin.copy:
+      src: files/sshd_config
+      dest: /etc/ssh/sshd_config
+      owner: root
+      group: root
+      mode: '0644'
+      validate: '/usr/sbin/sshd -t -f %s'
+    notify: Restart SSH
+
+  - name: Disable password authentication in cloud-init SSH drop-in
+    ansible.builtin.lineinfile:
+      path: /etc/ssh/sshd_config.d/50-cloud-init.conf
+      regexp: '^\s*#?\s*PasswordAuthentication\s+'
+      line: 'PasswordAuthentication no'
+      create: true
+      owner: root
+      group: root
+      mode: '0644'
+    notify: Restart SSH
+
+  - name: Install resource monitoring script
+    ansible.builtin.copy:
+      src: files/check_resources.sh
+      dest: /root/check_resources.sh
+      owner: root
+      group: root
+      mode: '0744'
+
+  - name: Schedule resource checks every two minutes in root's crontab
+    ansible.builtin.cron:
+      name: Check system resources
+      user: root
+      minute: '*/2'
+      job: /root/check_resources.sh
+      state: present
+
+  - name: Ensure cron service is enabled and running
+    ansible.builtin.service:
+      name: cron
+      state: started
+      enabled: true
+
+  - name: Ensure Fail2ban service is enabled and running
+    ansible.builtin.service:
+      name: fail2ban
+      state: started
+      enabled: true
+
+  - name: Disable IPv6 rule management in UFW
+    ansible.builtin.lineinfile:
+      path: /etc/default/ufw
+      regexp: '^\s*IPV6='
+      line: 'IPV6=no'
+      create: true
+      owner: root
+      group: root
+      mode: '0644'
+    register: ufw_ipv6_setting
+
+  - name: Read current UFW status before reconciling rules
+    ansible.builtin.command: ufw status
+    register: ufw_status
+    changed_when: false
+    failed_when: false
+
+  - name: Reset UFW if its rules are not exactly the requested allowlist
+    ansible.builtin.command: ufw --force reset
+    when: >-
+      ufw_ipv6_setting.changed or 'Status: active' not in ufw_status.stdout or (ufw_status.stdout_lines | select('search', '\\s+(ALLOW|DENY|REJECT|LIMIT)\\s+') | list | length != 3) or not (ufw_status.stdout | regex_search('(?m)^\\s*4044/tcp\\s+ALLOW\\s+Anywhere\\s*$')) or not (ufw_status.stdout | regex_search('(?m)^\\s*80/tcp\\s+ALLOW\\s+Anywhere\\s*$')) or not (ufw_status.stdout | regex_search('(?m)^\\s*443/tcp\\s+ALLOW\\s+Anywhere\\s*$'))
+    register: ufw_reset
+    changed_when: true
+
+  - name: Set default incoming policy to deny
+    ansible.builtin.command: ufw default deny incoming
+    register: ufw_default_incoming
+    changed_when: "'Default incoming policy changed' in ufw_default_incoming.stdout"
+
+  - name: Set default outgoing policy to allow
+    ansible.builtin.command: ufw default allow outgoing
+    register: ufw_default_outgoing
+    changed_when: "'Default outgoing policy changed' in ufw_default_outgoing.stdout"
+
+  - name: Set default routed policy to deny
+    ansible.builtin.command: ufw default deny routed
+    register: ufw_default_routed
+    changed_when: "'Default routed policy changed' in ufw_default_routed.stdout"
+
+  - name: Allow only the required TCP ports through UFW
+    ansible.builtin.command: "ufw allow {{ item }}/tcp"
+    loop: "{{ allowed_tcp_ports }}"
+    register: ufw_allow_rules
+    changed_when: "'Skipping adding existing rule' not in ufw_allow_rules.stdout"
+
+  - name: Enable UFW
+    ansible.builtin.command: ufw --force enable
+    when: "'Status: active' not in ufw_status.stdout or ufw_reset is changed"
+    changed_when: true
+
+  - name: Enable Docker-published-port allowlist service
+    ansible.builtin.systemd:
+      name: docker-published-port-allowlist
+      enabled: true
+      state: started
+      daemon_reload: true
+
+  - name: Validate the final SSH configuration
+    ansible.builtin.command: /usr/sbin/sshd -t
+    changed_when: false
+
+  - name: Validate Fail2ban configuration
+    ansible.builtin.command: fail2ban-client -t
+    changed_when: false
+    notify: Restart Fail2ban
+
+  - name: Show final UFW rules
+    ansible.builtin.command: ufw status
+    register: ufw_final_status
+    changed_when: false
+
+  - name: Print final UFW status
+    ansible.builtin.debug:
+      var: ufw_final_status.stdout_lines
+
+  handlers:
+  - name: Rebuild GRUB configuration
+    ansible.builtin.command: update-grub
+    changed_when: true
+
+  - name: Reload systemd daemon
+    ansible.builtin.systemd:
+      daemon_reload: true
+
+  - name: Restart Docker daemon
+    ansible.builtin.systemd:
+      name: docker
+      state: restarted
+
+  - name: Refresh Docker published-port allowlist
+    ansible.builtin.systemd:
+      name: docker-published-port-allowlist
+      state: restarted
+
+  - name: Restart SSH
+    ansible.builtin.service:
+      name: ssh
+      state: restarted
+
+  - name: Restart Fail2ban
+    ansible.builtin.service:
+      name: fail2ban
+      state: restarted
+
+  - name: Reload UFW
+    ansible.builtin.command: ufw reload

@@ -1,0 +1,14 @@
+#Public Keys
+admin_authorized_keys: []
+develop_authorized_keys: []
+
+# SHA-512 crypt hash for the requested develop account password.
+# Use Ansible Vault if you want to manage credentials more privately.
+develop_password_hash: ''
+
+# Defaults to the inventory's ansible_user. Override this if needed.
+admin_ssh_user: "{{ ansible_user | default('root') }}"
+
+# Host interface used for inbound Docker-published port filtering.
+# Override for servers with a different public/default interface.
+docker_external_interface: "{{ ansible_facts.get('default_ipv4', {}).get('interface', 'eth0') }}"

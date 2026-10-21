@@ -1,0 +1,11 @@
+[servers]
+server1 ansible_host=192.168.100.1 ansible_user=root ansible_port=22
+server2 ansible_host=192.168.100.2 ansible_user=root ansible_port=22
+
+[servers:vars]
+#tell Ansible to use privilege escalation
+ansible_become=true
+ansible_python_interpreter=/usr/bin/python3
+
+#Fix crappy sudo-rs bug in Ubuntu 26.04
+ansible_become_exe=/usr/bin/sudo.ws
